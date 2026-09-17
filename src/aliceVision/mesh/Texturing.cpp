@@ -217,6 +217,83 @@ inline GEO::vec3 mesh_facet_interpolate_normal_at_point(const StaticVector<Point
     return GEO::normalize(n);
 }
 
+/**
+ * @brief Interpolate tangent (T) and bitangent (B) at a point inside a triangle.
+ *
+ * This function computes the tangent and bitangent at an arbitrary point `p` inside
+ * triangle `f` by barycentric interpolation of per-vertex T and B.
+ *
+ * @param mesh        The mesh.
+ * @param tangents    Per-vertex tangent vectors.
+ * @param bitangents  Per-vertex bitangent vectors.
+ * @param f           Index of the triangle (facet) containing the point.
+ * @param p           3D point inside the triangle.
+ * @param[out] T_out  Interpolated tangent vector (normalized).
+ * @param[out] B_out  Interpolated bitangent vector (normalized).
+ */
+
+  inline void mesh_facet_interpolate_TBN_at_point(const GEO::Mesh& mesh,
+                                                 const std::vector<GEO::vec3>& normals,
+                                                 const std::vector<GEO::vec3>& tangents,
+                                                 const std::vector<GEO::vec3>& bitangents,
+                                                 const std::array<double, 3>& sign,
+                                                 GEO::index_t f,
+                                                 const Point2d barycCoords,
+                                                 Eigen::Matrix3d& W2T)
+{
+    // Tangents, bitangents et normales par sommet
+    const GEO::vec3 T0 = tangents[0];
+    const GEO::vec3 T1 = tangents[1];
+    const GEO::vec3 T2 = tangents[2];
+
+    const GEO::vec3 B0 = bitangents[0];
+    const GEO::vec3 B1 = bitangents[1];
+    const GEO::vec3 B2 = bitangents[2];
+
+    const GEO::vec3 N0 = normals[0];
+    const GEO::vec3 N1 = normals[1];
+    const GEO::vec3 N2 = normals[2];
+
+    const double w2 = barycCoords.x;  // l3
+    const double w1 = barycCoords.y;  // l2
+    const double w0 = 1.0 - w1 - w2;  // l1
+
+    // Interpolation barycentrique
+    GEO::vec3 T_out = w0 * T0 + w1 * T1 + w2 * T2;
+    GEO::vec3 N_out = w0 * N0 + w1 * N1 + w2 * N2;
+
+    double s = w0 * sign[0] + w1 * sign[1] + w2 * sign[2];
+    double finalSign = (s < 0.0) ? -1.0 : 1.0;
+
+    Eigen::Vector3d T(T_out.x, T_out.y, T_out.z);
+    Eigen::Vector3d N(N_out.x, N_out.y, N_out.z);
+
+    if (N.squaredNorm() < 1e-30)
+        N = Eigen::Vector3d(0, 0, 1);
+    else
+        N.normalize();
+    
+    T = T - N * T.dot(N);
+    if (T.squaredNorm() < 1e-30)
+        T = N.unitOrthogonal();
+    else
+        T.normalize();
+
+    Eigen::Vector3d B = finalSign * N.cross(T);
+    if (B.squaredNorm() < 1e-30)
+        B = N.cross(T);
+    else
+        B.normalize();
+
+    Eigen::Matrix3d TBN;
+    TBN.col(0) = T;
+    TBN.col(1) = B;
+    TBN.col(2) = N;
+
+    // Tangent space is defined by TBN, so world->tangent is TBN^T
+    W2T = TBN.transpose();
+}
+
 template<class T, GEO::index_t DIM>
 inline Eigen::Matrix<T, DIM, 1> toEigen(const GEO::vecng<DIM, T>& v)
 {
@@ -262,6 +339,116 @@ inline Eigen::Matrix3d computeTriangleTransform(const Mesh& mesh, int f, const P
     const Eigen::Matrix3d mT = m.transpose();
 
     return mT;
+}
+
+
+void computeVertexTangents(const Mesh& mesh,
+                           std::vector<GEO::vec3>& vertexTangents,
+                           std::vector<GEO::vec3>& vertexBitangents,
+                           std::vector<double>& vertexSigns)
+{
+    const size_t numVertices = mesh.pts.size();
+
+    // Initialisation des vecteurs de sortie (en Geo::vec3)
+    vertexTangents.assign(numVertices, GEO::vec3(0, 0, 0));
+    vertexBitangents.assign(numVertices, GEO::vec3(0, 0, 0));
+    vertexSigns.assign(numVertices, 1.0);
+
+    // Vecteurs de travail temporaires pour l'accumulation (en Eigen pour les calculs)
+    std::vector<Eigen::Vector3d> accT(numVertices, Eigen::Vector3d::Zero());
+    std::vector<Eigen::Vector3d> accB(numVertices, Eigen::Vector3d::Zero());
+
+    const size_t numTris = mesh.tris.size();
+    const bool hasUVs = (mesh.trisUvIds.size() == numTris);
+
+    for (size_t triId = 0; triId < numTris; ++triId)
+    {
+        if (!hasUVs)
+            continue;
+
+        const auto& tri = mesh.tris[triId];
+        const auto& uvIds = mesh.trisUvIds[triId];
+
+        const int v0 = tri.v[0];
+        const int v1 = tri.v[1];
+        const int v2 = tri.v[2];
+
+        // Validation indices UV
+        bool validUV = true;
+        for (int k = 0; k < 3; ++k)
+        {
+            const int uvid = uvIds.m[k];
+            if (uvid < 0 || uvid >= (int)mesh.uvCoords.size())
+            {
+                validUV = false;
+                break;
+            }
+        }
+        if (!validUV)
+            continue;
+
+        const Eigen::Vector3d p0 = toEigen(mesh.pts[v0]);
+        const Eigen::Vector3d p1 = toEigen(mesh.pts[v1]);
+        const Eigen::Vector3d p2 = toEigen(mesh.pts[v2]);
+
+        const Eigen::Vector2d t0(mesh.uvCoords[uvIds.m[0]].x, mesh.uvCoords[uvIds.m[0]].y);
+        const Eigen::Vector2d t1(mesh.uvCoords[uvIds.m[1]].x, mesh.uvCoords[uvIds.m[1]].y);
+        const Eigen::Vector2d t2(mesh.uvCoords[uvIds.m[2]].x, mesh.uvCoords[uvIds.m[2]].y);
+
+        const Eigen::Vector3d e1 = p1 - p0;
+        const Eigen::Vector3d e2 = p2 - p0;
+        const Eigen::Vector2d duv1 = t1 - t0;
+        const Eigen::Vector2d duv2 = t2 - t0;
+
+        const double det = duv1.x() * duv2.y() - duv2.x() * duv1.y();
+        const double EPSILON = 1e-10;
+
+        if (std::abs(det) < EPSILON)
+            continue;
+
+        const double invDet = 1.0 / det;
+        const Eigen::Vector3d T = (e1 * duv2.y() - e2 * duv1.y()) * invDet;
+        const Eigen::Vector3d B = (e2 * duv1.x() - e1 * duv2.x()) * invDet;
+
+        // Calcul de l'aire pour la pondération (évite le facettage)
+        const double area = (e1.cross(e2)).norm() * 0.5;
+        accT[v0] += T * area;
+        accT[v1] += T * area;
+        accT[v2] += T * area;
+
+        accB[v0] += B * area;
+        accB[v1] += B * area;
+        accB[v2] += B * area;
+    }
+
+    const bool hasNormals = (mesh.normals.size() == numVertices);
+
+    // Finalisation et transfert vers Geo::vec3
+    for (size_t i = 0; i < numVertices; ++i)
+    {
+        Eigen::Vector3d N = hasNormals ? toEigen(mesh.normals[i]).normalized() : Eigen::Vector3d(0, 0, 1);
+        Eigen::Vector3d T = accT[i];
+        Eigen::Vector3d B = accB[i];
+
+        // Gram-Schmidt : Orthogonalisation de la tangente par rapport à la normale lissée
+        if (T.squaredNorm() < 1e-12)
+        {
+            T = N.unitOrthogonal();
+        }
+        else
+        {
+            T = (T - N * T.dot(N)).normalized();
+        }
+
+        // Calcul du bitangent final avec gestion de la main (handedness)
+        double sign = (N.cross(T).dot(B) < 0.0) ? -1.0 : 1.0;
+        Eigen::Vector3d finalB = (sign * N.cross(T)).normalized();
+
+        // Conversion finale vers Geo::vec3
+        vertexTangents[i] = GEO::vec3(T.x(), T.y(), T.z());
+        vertexBitangents[i] = GEO::vec3(finalB.x(), finalB.y(), finalB.z());
+        vertexSigns[i] = sign;
+    }
 }
 
 inline void computeNormalHeight(const GEO::Mesh& mesh,
@@ -878,6 +1065,16 @@ void Texturing::generateTexturesSubSet(const mvsUtils::MultiViewParams& mp,
             visitedPixels.fill(false);
 
             // Rotation and normalization of normals
+            GEO::Mesh geoMesh;
+            toGeoMesh(*mesh, geoMesh);
+
+            std::vector<GEO::vec3> vertexTangents;
+            std::vector<GEO::vec3> vertexBitangents;
+            std::vector<double> vertexSigns;
+
+            // Compute tangent frame for every vertex
+            computeVertexTangents(*mesh, vertexTangents, vertexBitangents, vertexSigns);
+
 #pragma omp parallel for
             for (int i = 0; i < static_cast<int>(_atlases[atlasID].size()); ++i)
             {
@@ -887,8 +1084,7 @@ void Texturing::generateTexturesSubSet(const mvsUtils::MultiViewParams& mp,
                 Point2d triPixs[3];
                 Point3d triPts[3];
                 auto& triangleUvIds = mesh->trisUvIds[triangleId];
-
-                // Retrieve triangle normal
+                //const double minEdgeLength = mesh->computeTriangleMinEdgeLength(triangleId);
 
                 // Compute the Bottom-Left minima of the current UDIM for [0,1] range remapping
                 Point2d udimBL;
@@ -896,18 +1092,59 @@ void Texturing::generateTexturesSubSet(const mvsUtils::MultiViewParams& mp,
                 udimBL.x = std::floor(std::min({uvCoords[triangleUvIds[0]].x, uvCoords[triangleUvIds[1]].x, uvCoords[triangleUvIds[2]].x}));
                 udimBL.y = std::floor(std::min({uvCoords[triangleUvIds[0]].y, uvCoords[triangleUvIds[1]].y, uvCoords[triangleUvIds[2]].y}));
 
+                std::vector<GEO::vec3> Tverts;
+                std::vector<GEO::vec3> Bverts;
+                std::vector<GEO::vec3> Nverts;
+                std::array<double, 3> Sverts;
+
+                Tverts.reserve(3);
+                Bverts.reserve(3);
+                Nverts.reserve(3);
+
+                bool triValid = true;
+
+                if (triangleId < 0 || triangleId >= (int)mesh->tris.size())
+                    continue;
+
                 for (int k = 0; k < 3; k++)
                 {
                     const int pointIndex = (mesh->tris)[triangleId].v[k];
-                    triPts[k] = (mesh->pts)[pointIndex];  // 3D coordinates
+                    triPts[k] = mesh->pts[pointIndex];
                     const int uvPointIndex = triangleUvIds.m[k];
 
-                    Point2d uv = uvCoords[uvPointIndex];
-                    // UDIM: remap coordinates between [0,1]
-                    uv = uv - udimBL;
+                    // Indices indispensables
+                    if (pointIndex < 0 || pointIndex >= (int)mesh->pts.size() || pointIndex >= (int)vertexTangents.size() ||
+                        pointIndex >= (int)vertexBitangents.size() || pointIndex >= (int)vertexSigns.size() || uvPointIndex < 0 ||
+                        uvPointIndex >= (int)uvCoords.size())
+                    {
+                        triValid = false;
+                        break;
+                    }
 
-                    triPixs[k] = uv * texParams.textureSide;  // UV coordinates
+                    // 3) Accès maintenant sûr
+                    triPts[k] = mesh->pts[pointIndex];
+                    Sverts[k] = vertexSigns[pointIndex];
+
+                    Point2d uv = uvCoords[uvPointIndex];
+                    uv = uv - udimBL;
+                    triPixs[k] = uv * texParams.textureSide;
+
+                    Tverts.push_back(vertexTangents[pointIndex]);
+                    Bverts.push_back(vertexBitangents[pointIndex]);
+
+                    if (pointIndex >= 0 && pointIndex < (int)mesh->normals.size())
+                        Nverts.push_back(mesh->normals[pointIndex]);
+                    else
+                        Nverts.emplace_back(0.0, 0.0, 1.0);  // fallback POC
+
                 }
+
+                // --- Si triangle invalide, on le saute complètement ---
+                if (!triValid || Tverts.size() != 3 || Bverts.size() != 3 || Nverts.size() != 3)
+                {
+                    continue;
+                }
+
 
                 // compute triangle bounding box in pixel indexes
                 // min values: floor(value)
@@ -948,18 +1185,16 @@ void Texturing::generateTexturesSubSet(const mvsUtils::MultiViewParams& mp,
                         // 1D pixel index
                         const unsigned int xyoffset = y_ * texParams.textureSide + x;
 
-                        /*
                         // get 3D coordinates
                         const Point3d pt3d = barycentricToCartesian(triPts, barycCoords);
                         const GEO::vec3 q(pt3d.x, pt3d.y, pt3d.z);
 
-                        // Texel normal (weighted normal from the 3 vertices normals), instead of face normal for better
-                        // transitions (reduce seams)
-                        const GEO::vec3 triangleNormal_p = mesh_facet_interpolate_normal_at_point(sparseMesh, triangleId, q);
-                        // const GEO::vec3 triangleNormal_p = GEO::vec3(triangleNormal.m); // to use the triangle normal instead
-                        const GEO::vec3 scaledTriangleNormal = triangleNormal_p * minEdgeLength * 10; // ??????
+                        GEO::vec3 T_vec;
+                        GEO::vec3 B_vec;
+                        GEO::vec3 N_vec;
+                        Eigen::Matrix3d W2T;
 
-                        */
+                        mesh_facet_interpolate_TBN_at_point(geoMesh, Nverts, Tverts, Bverts, Sverts, triangleId, barycCoords, W2T);
 
                         Vec3 origNormal = atlasTexture.img(xyoffset).cast<double>();
                         if (visitedPixels(x, y))
@@ -968,7 +1203,17 @@ void Texturing::generateTexturesSubSet(const mvsUtils::MultiViewParams& mp,
                         }
                         visitedPixels(x, y) = true;
 
-                        origNormal = worldToTriangleMatrix * origNormal;
+                        Vec3 oldVersion = worldToTriangleMatrix * origNormal;
+                        Vec3 newVersion = W2T * origNormal;
+
+                        if (oldVersion.dot(newVersion) < 0)
+                        {
+                            origNormal[2] *= -1.0;
+                            origNormal[1] *= -1.0;
+                        }
+                        
+                        origNormal = W2T * origNormal;
+
                         origNormal.normalize();
 
                         origNormal = origNormal * 0.5 + Vec3(0.5, 0.5, 0.5);  // Normal in visual representation
